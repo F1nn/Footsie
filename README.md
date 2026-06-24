@@ -8,7 +8,7 @@ It uses an analog slide potentiometer as the pedal position input, reads that po
 
 ## Why?
 
-I originally built Footsie for a pottery / ceramics wheel I made for my wife. The commercially available foot pedals I tried were not quite right: low-speed control was poor, the pedal travel was not used effectively, and the response did not feel natural.
+I originally built Footsie for a pottery / ceramics wheel I made for my wife. The commercially available foot pedals I tried were not quite right: low-speed control was poor, the pedal travel was not used effectively and the response did not feel natural.
 
 Footsie exists to solve that problem.
 
@@ -99,7 +99,9 @@ git clone <repository-url>
 cd Footsie
 ```
 2. **Set-up ESP-IDF**
+
 Follow the normal ESP-IDF setup process for your operating system and editor.
+
 3. **Build / flash and monitor**
 
 ```sh
@@ -127,5 +129,3 @@ You are responsible for ensuring any system using Footsie is safe, suitable, and
 ## 📄 License
 
 MIT License (see LICENSE file)
-
----
