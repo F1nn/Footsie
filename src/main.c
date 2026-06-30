@@ -3,6 +3,9 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <inttypes.h>
+#include <string.h>
+#include <stdbool.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -17,29 +20,64 @@
 
 #define EXAMPLE_READ_LEN                    64 // 16 samples, each sample has 4 bytes (see SOC_ADC_DIGI_RESULT_BYTES)
 #define MAX_PARSED_SAMPLES                  (EXAMPLE_READ_LEN / SOC_ADC_DIGI_RESULT_BYTES)
+/* TODO: move calibration and scale constants to Kconfig/menuconfig or NVS */
 /* ADC reference (in mV) for converting ADC code to millivolts */
 #define ADC_VREF_MV                         3300
 /* DAC full-scale output target in mV */
 #define DAC_FULL_SCALE_MV                   5000
 /* Maximum DAC update rate */
 #define DAC_UPDATE_PERIOD_MS                20
+/* Output curve exponent: >1.0 gives finer control at the low end. */
+#define OUTPUT_CURVE_GAMMA                  2.2f
 /* ADC calibrated range (mV) - adjust these to match your potentiometer's actual measurement range */
 /* Set to the calibrated ADC reading at the pot's minimum position */
 #define ADC_MIN_CALIBRATED_MV               139
 /* Set to the calibrated ADC reading at the pot's maximum position */
 #define ADC_MAX_CALIBRATED_MV               3181
+#define ADC_SPAN_MV                         (ADC_MAX_CALIBRATED_MV - ADC_MIN_CALIBRATED_MV)
 
 static adc_channel_t channel[1] = {ADC_CHANNEL_2}; // Channel 2 maps to GPIO3
 
 static const char *TAG = "Footsie";
 
 CRGB *ws2812_buffer;
+static bool ws2812_ready = false;
 dac80501_device_t dac80501_dev;
 i2c_master_bus_handle_t i2c_bus_handle = NULL;
 static dac80501_status_t dac_status = DAC80501_ERR_NOT_INITIALIZED;
 static adc_cali_handle_t adc_cali_handle = NULL;
 
 static adc_continuous_data_t s_parsed_data[MAX_PARSED_SAMPLES];
+
+static uint32_t adc_mV_to_curved_dac_mV(uint32_t adc_mV)
+{
+    if (ADC_SPAN_MV <= 0) {
+        return 0;
+    }
+
+    if (adc_mV <= ADC_MIN_CALIBRATED_MV) {
+        return 0;
+    }
+
+    if (adc_mV >= ADC_MAX_CALIBRATED_MV) {
+        return DAC_FULL_SCALE_MV;
+    }
+
+    float normalized = (float)(adc_mV - ADC_MIN_CALIBRATED_MV) / (float)ADC_SPAN_MV;
+    if (normalized < 0.0f) {
+        normalized = 0.0f;
+    } else if (normalized > 1.0f) {
+        normalized = 1.0f;
+    }
+
+    float curved = powf(normalized, OUTPUT_CURVE_GAMMA);
+    uint32_t output_mV = (uint32_t)((curved * (float)DAC_FULL_SCALE_MV) + 0.5f);
+    if (output_mV > DAC_FULL_SCALE_MV) {
+        output_mV = DAC_FULL_SCALE_MV;
+    }
+
+    return output_mV;
+}
 
 static void continuous_adc_init(adc_channel_t *channel, uint8_t channel_num, adc_continuous_handle_t *out_handle)
 {
@@ -132,6 +170,7 @@ static void sys_init(void) {
     // WS2812B RGB LED driver initialisation.
     if (ws28xx_init(PIN_RGB, WS2812B, 1, &ws2812_buffer) == ESP_OK) {
         // Set LED to green as init complete confirmation
+        ws2812_ready = true;
         ws2812_buffer[0] = (CRGB){.r=0, .g=1, .b=0};
         ESP_ERROR_CHECK_WITHOUT_ABORT(ws28xx_update());
     } else {
@@ -187,12 +226,18 @@ void app_main(void) {
 
     while (1) {
         uint32_t num_parsed_samples = 0;
+        bool adc_read_valid = false;
 
         ret = adc_continuous_read(handle, result, EXAMPLE_READ_LEN, &ret_num, 0);
         if (ret == ESP_OK) {
+            adc_read_valid = true;
             esp_err_t parse_ret = adc_continuous_parse_data(handle, result, ret_num, s_parsed_data, &num_parsed_samples);
             if (parse_ret == ESP_OK) {
-                for (int i = 0; i < num_parsed_samples; i++) {
+                        if (num_parsed_samples > MAX_PARSED_SAMPLES) {
+                            ESP_LOGW(TAG, "Parsed samples (%u) exceed buffer (%u), clipping", num_parsed_samples, MAX_PARSED_SAMPLES);
+                            num_parsed_samples = MAX_PARSED_SAMPLES;
+                        }
+                for (uint32_t i = 0; i < num_parsed_samples; i++) {
                     if (s_parsed_data[i].valid) {
                         int calibrated_mv = 0;
                         if (adc_cali_handle != NULL) {
@@ -219,40 +264,79 @@ void app_main(void) {
         TickType_t now = xTaskGetTickCount();
         if (last_dac_update_tick == 0 || (now - last_dac_update_tick) >= dac_update_period_ticks) {
             uint32_t samples_used = window_sample_count;
+            bool update_valid = false;
+            float last_normalized_value = 0.0f;
+            float last_curved_value = 0.0f;
 
-            if (window_sample_count > 0) {
-                uint32_t avg_value = (uint32_t)(window_sample_sum_mV / window_sample_count);
-                last_avg_value_mV = avg_value;
+                if (window_sample_count > 0) {
+                    uint32_t avg_value = (uint32_t)(window_sample_sum_mV / window_sample_count);
+                    last_avg_value_mV = avg_value;
 
-                // Clamp averaged reading to the calibrated measurement range.
-                uint32_t clamped_value = avg_value;
-                if (clamped_value < ADC_MIN_CALIBRATED_MV) {
-                    clamped_value = ADC_MIN_CALIBRATED_MV;
+                    /* Clamp averaged reading to the calibrated measurement range. */
+                    uint32_t clamped_value = avg_value;
+                    if (clamped_value < ADC_MIN_CALIBRATED_MV) {
+                        clamped_value = ADC_MIN_CALIBRATED_MV;
+                    }
+                    if (clamped_value > ADC_MAX_CALIBRATED_MV) {
+                        clamped_value = ADC_MAX_CALIBRATED_MV;
+                    }
+
+                    last_clamped_value_mV = clamped_value;
+                    if (ADC_SPAN_MV <= 0) {
+                        ESP_LOGW(TAG, "Invalid ADC calibration span (denom=0), skipping mapping to DAC");
+                        last_unclamped_target_mV = 0;
+                        last_target_mV = 0;
+                    } else {
+                        last_normalized_value = (float)(clamped_value - ADC_MIN_CALIBRATED_MV) / (float)ADC_SPAN_MV;
+                        if (last_normalized_value < 0.0f) {
+                            last_normalized_value = 0.0f;
+                        } else if (last_normalized_value > 1.0f) {
+                            last_normalized_value = 1.0f;
+                        }
+                        last_curved_value = powf(last_normalized_value, OUTPUT_CURVE_GAMMA);
+                        last_unclamped_target_mV = (int32_t)(((int64_t)((int32_t)avg_value - (int32_t)ADC_MIN_CALIBRATED_MV) * DAC_FULL_SCALE_MV) / (int32_t)ADC_SPAN_MV);
+                        last_target_mV = adc_mV_to_curved_dac_mV(clamped_value);
+                        update_valid = true;
+                    }
                 }
-                if (clamped_value > ADC_MAX_CALIBRATED_MV) {
-                    clamped_value = ADC_MAX_CALIBRATED_MV;
+
+            if (ws2812_ready && ws2812_buffer != NULL) {
+                uint8_t led_green = 0;
+                if (update_valid) {
+                    led_green = (uint8_t)(((uint64_t)last_target_mV * 255u + (DAC_FULL_SCALE_MV / 2u)) / DAC_FULL_SCALE_MV);
                 }
 
-                last_clamped_value_mV = clamped_value;
-                last_unclamped_target_mV = (int32_t)(((int64_t)((int32_t)avg_value - (int32_t)ADC_MIN_CALIBRATED_MV) * DAC_FULL_SCALE_MV) /
-                                                     ((int32_t)ADC_MAX_CALIBRATED_MV - (int32_t)ADC_MIN_CALIBRATED_MV));
-                last_target_mV = (uint32_t)(((uint64_t)(clamped_value - ADC_MIN_CALIBRATED_MV) * DAC_FULL_SCALE_MV) /
-                                            (ADC_MAX_CALIBRATED_MV - ADC_MIN_CALIBRATED_MV));
+                ws2812_buffer[0] = (CRGB){.r=0, .g=led_green, .b=0};
+                ESP_ERROR_CHECK_WITHOUT_ABORT(ws28xx_update());
             }
 
-            ws2812_buffer[0] = (CRGB){.r=0, .g=last_clamped_value_mV / 16, .b=0};
-            ESP_ERROR_CHECK_WITHOUT_ABORT(ws28xx_update());
-
-            if (dac80501_write_voltage(&dac80501_dev, last_target_mV, 0) != DAC80501_OK) {
-                ESP_LOGW(TAG, "Failed to write %u mV to DAC", last_target_mV);
+            if (update_valid && dac_status == DAC80501_OK) {
+                if (dac80501_write_voltage(&dac80501_dev, last_target_mV, 0) != DAC80501_OK) {
+                    ESP_LOGW(TAG, "Failed to write %u mV to DAC", last_target_mV);
+                }
+            } else {
+                if (dac_status == DAC80501_OK && dac80501_write_voltage(&dac80501_dev, 0, 0) != DAC80501_OK) {
+                    ESP_LOGW(TAG, "Failed to write 0mV to DAC during fail-safe handling");
+                }
+                if (!adc_read_valid) {
+                    ESP_LOGW(TAG, "ADC read failed, driving DAC to zero");
+                } else {
+                    ESP_LOGW(TAG, "No valid ADC update, driving DAC to zero");
+                }
             }
 
-            ESP_LOGI(TAG, "Update: samples=%5u, avg_u=%5u mV, avg_c=%5u mV, target_u=%6"PRId32" mV, target_c=%5u mV",
+            uint32_t applied_target_mV = update_valid ? last_target_mV : 0;
+            int32_t curve_delta_mV = (int32_t)applied_target_mV - last_unclamped_target_mV;
+
+            ESP_LOGI(TAG, "Map: s=%u avg=%u in=%u lin=%" PRId32 " out=%u d=%+" PRId32 " n=%0.3f g=%0.3f",
                      samples_used,
                      last_avg_value_mV,
                      last_clamped_value_mV,
                      last_unclamped_target_mV,
-                     last_target_mV);
+                     applied_target_mV,
+                     curve_delta_mV,
+                     (double)last_normalized_value,
+                     (double)last_curved_value);
 
             window_sample_sum_mV = 0;
             window_sample_count = 0;
@@ -262,12 +346,4 @@ void app_main(void) {
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 
-    ESP_ERROR_CHECK(adc_continuous_stop(handle));
-    ESP_ERROR_CHECK(adc_continuous_deinit(handle));
-
-    if (adc_cali_handle != NULL) {
-        adc_cali_delete_scheme_curve_fitting(adc_cali_handle);
-    }
-
-    // vTaskDelay(100 / portTICK_PERIOD_MS);
 }

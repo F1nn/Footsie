@@ -34,6 +34,11 @@ static const uint16_t timing_bits[16] = {
 esp_err_t ws28xx_init(int pin, led_strip_model_t model, int num_of_leds,
                       CRGB **led_buffer_ptr) {
     esp_err_t err = ESP_OK;
+
+    if (!led_buffer_ptr || num_of_leds <= 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
     n_of_leds = num_of_leds;
     led_model = model;
     // Insrease if something breaks. values are less than recommended in
@@ -52,18 +57,24 @@ esp_err_t ws28xx_init(int pin, led_strip_model_t model, int num_of_leds,
                              spi_settings.dma_chan);
     if (err != ESP_OK) {
         free(ws28xx_pixels);
+        ws28xx_pixels = NULL;
         return err;
     }
     err = spi_bus_add_device(spi_settings.host, &spi_settings.devcfg,
                              &spi_settings.spi);
     if (err != ESP_OK) {
+        spi_bus_free(spi_settings.host);
         free(ws28xx_pixels);
+        ws28xx_pixels = NULL;
         return err;
     }
     // Critical to be DMA memory.
     dma_buffer = heap_caps_malloc(dma_buf_size, MALLOC_CAP_DMA);
     if (dma_buffer == NULL) {
+        spi_bus_remove_device(spi_settings.spi);
+        spi_bus_free(spi_settings.host);
         free(ws28xx_pixels);
+        ws28xx_pixels = NULL;
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
@@ -78,6 +89,9 @@ void ws28xx_fill_all(CRGB color) {
 esp_err_t ws28xx_update() {
     esp_err_t err;
     int n = 0;
+    if (!dma_buffer || !ws28xx_pixels) {
+        return ESP_ERR_INVALID_STATE;
+    }
     memset(dma_buffer, 0, dma_buf_size);
     dma_buffer[n++] = 0;
     for (int i = 0; i < n_of_leds; i++) {
@@ -90,11 +104,11 @@ esp_err_t ws28xx_update() {
 
             // Green
             dma_buffer[n++] = timing_bits[0x0f & (temp >> 12)];
-            dma_buffer[n++] = timing_bits[0x0f & (temp) >> 8];
+            dma_buffer[n++] = timing_bits[0x0f & (temp >> 8)];
         } else {
             // Green
             dma_buffer[n++] = timing_bits[0x0f & (temp >> 12)];
-            dma_buffer[n++] = timing_bits[0x0f & (temp) >> 8];
+            dma_buffer[n++] = timing_bits[0x0f & (temp >> 8)];
 
             // Red
             dma_buffer[n++] = timing_bits[0x0f & (temp >> 4)];
@@ -102,7 +116,7 @@ esp_err_t ws28xx_update() {
         }
         // Blue
         dma_buffer[n++] = timing_bits[0x0f & (temp >> 20)];
-        dma_buffer[n++] = timing_bits[0x0f & (temp) >> 16];
+        dma_buffer[n++] = timing_bits[0x0f & (temp >> 16)];
     }
     for (int i = 0; i < reset_delay; i++) {
         dma_buffer[n++] = 0;
