@@ -4,6 +4,11 @@ Footsie is a configurable foot pedal controller built around an ESP32-S3, a slid
 
 It reads pedal position, applies a tunable response curve, smooths the input, and outputs an analog control voltage for a connected machine or controller.
 
+## Screenshots
+
+<a href="images/Footsie_App.jpg"><img src="images/Footsie_App.jpg" width="300" alt="Footsie App"></a>
+<a href="images/Footsie_ADC_Calibration.jpg"><img src="images/Footsie_ADC_Calibration.jpg" width="300" alt="Footsie ADC Calibration"></a>
+
 ## Why?
 
 I originally built Footsie for a pottery / ceramics wheel I made for my wife. The commercially available foot pedals I tried were not quite right: low-speed control was poor, the pedal travel was not used effectively and the response did not feel natural.
